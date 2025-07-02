@@ -32,7 +32,7 @@ python config_updater.py \
 
 # Change to model directory
 cd $MODEL_DIR
-SCRIPT_NAME="clip_feature_generation_train.py"
+SCRIPT_NAME="clip_feature_extration_train.py"
 echo "CONFIG_PATH: $CONFIG_PATH"
 echo "SCRIPT_NAME: $SCRIPT_NAME"
 

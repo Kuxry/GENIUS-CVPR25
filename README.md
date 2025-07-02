@@ -51,8 +51,8 @@ GENIUS consists of three key components that work together in a three-stage trai
 Clone the repository and create the Conda environment:
 
 ```bash
-git clone https://github.com/sung-yeon-kim/GENIUS.git
-cd GENIUS
+git clone https://github.com/sung-yeon-kim/GENIUS-CVPR25.git
+cd GENIUS-CVPR25
 conda env create -f genius_env.yml
 ```
 

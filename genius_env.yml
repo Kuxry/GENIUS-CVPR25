@@ -4,15 +4,15 @@ channels:
   - conda-forge
   - pytorch
 dependencies:
-  - python
+  - python=3.10
+  - numpy=1.24.4      # 안정적인 버전 (pip 말고 conda에서 설치)
   - pip
+  - pytorch
+  - torchvision
   - pip:
       - python-dotenv
       - pycocoevalcap
       - omegaconf
-      - numpy
-      - torch
-      - torchvision
       - wandb
       - ftfy
       - tqdm

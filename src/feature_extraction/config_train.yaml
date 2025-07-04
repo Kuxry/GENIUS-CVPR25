@@ -23,9 +23,9 @@ model:
   ckpt_config:
     ckpt_dir: checkpoint/CLIP_SF
     ckpt_name: clip_sf_large.pth
-    using_pretrained: false
+    using_pretrained: true
   clip_vision_model_name: ViT-L/14
-  emb_save_path: extracted_embed/CLIP_SF
+  emb_save_path: extracted_embed/CLIP_SF/train
   gather_embeddings: true
   name: CLIPScoreFusion
   pretrained_clip_model_dir: checkpoint/CLIP_SF/

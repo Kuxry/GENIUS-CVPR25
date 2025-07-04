@@ -432,22 +432,76 @@ def main(config: Any) -> None:
 # ================ Script Entry Point ================
 
 if __name__ == "__main__":
-    # Load environment variables
-    load_dotenv()
-    
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Train Residual Quantization model")
-    parser.add_argument("--config", type=str, required=True, help="Path to configuration file")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config_path", default="config.yaml", help="Path to the config file.")
+    parser.add_argument(
+        "--genir_dir",
+        type=str,
+        default="/data/GENIUS",
+        help="Path to GENIUS directory to save checkpoints, embeddings, etc.",
+    )
+    parser.add_argument(
+        "--mbeir_data_dir",
+        type=str,
+        default="/data/GENIUS/mbeir_data",
+        help="Path to mbeir dataset directory",
+    )
     args = parser.parse_args()
-    
-    # Load configuration
-    config = OmegaConf.load(args.config)
-    
-    # Run training
+    print(f"Loading config from {args.config_path}")
+    config = OmegaConf.load(args.config_path)
+
+    # Parse arguments to config
+    config.genir_dir = args.genir_dir
+    config.mbeir_data_dir = args.mbeir_data_dir
+
+    # Initialize distributed training
+    args.dist_url = config.dist_config.dist_url  # Note: The use of args is a historical artifact :(
+    utils.init_distributed_mode(args)
+    config.dist_config.gpu_id = args.gpu
+    config.dist_config.distributed_mode = args.distributed
+
+    # Set up wandb
+    if config.wandb_config.enabled and utils.is_main_process():
+        load_dotenv()  # Load .env and get WANDB_API_KEY, WANDB_PROJECT, and WANDB_ENTITY
+        wandb_key = config.wandb_config.wandb_key
+        wandb_project = config.wandb_config.wandb_project
+        wandb_entity = os.environ.get("WANDB_ENTITY")
+
+        if not wandb_key:
+            raise ValueError("WANDB_API_KEY not found. Ensure it's set in the .env file.")
+
+        wandb.login(key=wandb_key)
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=config.wandb_config.experiment_name,
+            config=OmegaConf.to_container(config, resolve=True),
+        )
+
+    # Set up logger
+    if utils.is_main_process():
+        logger_out_dir = os.path.join(config.genir_dir, config.logger_config.logger_out_dir)
+        logger_out_path = os.path.join(logger_out_dir, config.logger_config.logger_out_file_name)
+        if not os.path.exists(logger_out_dir):
+            os.makedirs(logger_out_dir, exist_ok=True)
+        handlers = [logging.FileHandler(logger_out_path), logging.StreamHandler()]
+        logging.basicConfig(
+            format="[%(asctime)s] %(levelname)s: %(message)s",
+            level=logging.DEBUG,
+            datefmt="%d-%m-%Y %H:%M:%S",
+            handlers=handlers,
+        )
+        logging.getLogger("PIL").setLevel(logging.WARNING)
+        logger = logging.getLogger(__name__)
+        logger.info(config)
+
     main(config)
 
-    # Cleanup
+    # Close wandb
     if config.wandb_config.enabled and utils.is_main_process():
         wandb.finish()
+
+    # Destroy the process group
     if config.dist_config.distributed_mode:
         torch.distributed.destroy_process_group()
+

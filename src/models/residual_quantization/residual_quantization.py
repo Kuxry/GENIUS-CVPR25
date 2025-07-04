@@ -19,8 +19,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import numpy as np
-import faiss
-import joblib
 from einops import rearrange, repeat, reduce, pack, unpack
 from torch.nn.utils import weight_norm
 from vector_quantize_pytorch import VectorQuantize, ResidualVQ

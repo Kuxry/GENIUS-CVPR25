@@ -28,7 +28,7 @@ model:
   emb_save_path: extracted_embed/CLIP_SF/train
   gather_embeddings: true
   name: CLIPScoreFusion
-  pretrained_clip_model_dir: checkpoint/CLIP_SF/
+  pretrained_clip_model_dir: checkpoint/CLIP/
   short_name: CLIP_SF
   size: Large
 seed: 2023

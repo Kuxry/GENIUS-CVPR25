@@ -1,7 +1,6 @@
 import os
 import json
 import torch
-import faiss
 import time
 import shutil
 import subprocess

@@ -1,7 +1,7 @@
 # Feature Extraction CLIP model on MBEIR dataset
 
 # Path to the codebase and config file
-genir_dir="/home/tjddus9597/GenIR/GENIUS-CVPR25" # <--- Change this to the GENIUS directory
+genir_dir="/GENIUS" # <--- Change this to the GENIUS directory
 SRC="$genir_dir/src"  # Absolute path to codebse /GENIUS/src # <--- Change this to the path of your GENIUS/src
 
 # Path to common dir

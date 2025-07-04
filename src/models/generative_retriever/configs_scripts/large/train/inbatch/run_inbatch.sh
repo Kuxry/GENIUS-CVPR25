@@ -1,4 +1,7 @@
-# Train CLIPScoreFusion model on MBEIR dataset
+#!/bin/bash
+
+# Script to train Generative Retrieval model on MBEIR dataset
+# This script handles distributed training setup and configuration updates
 
 # Path to the codebase and config file
 genir_dir="/GENIUS" # <--- Change this to the GENIUS directory

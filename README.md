@@ -135,7 +135,8 @@ bash run_feature_extraction_cand.sh
 
 2. Compile trie_cpp (recommended for faster inference):
 ```bash
-cd models/generative_retriever/trie_cpp
+cd models/generative_retriever
+pip install pybind11
 c++ -O3 -Wall -shared -std=c++17 -fPIC \
     $(python3 -m pybind11 --includes) \
     trie_cpp.cpp -o trie_cpp$(python3-config --extension-suffix)

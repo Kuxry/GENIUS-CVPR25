@@ -35,7 +35,6 @@ from transformers.file_utils import ModelOutput
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 from tqdm import tqdm
 
 # Local modules
@@ -148,7 +147,7 @@ class T5ForGenerativeRetrieval(nn.Module):
         self.config = config
         self.quantizer = RQ(config=config, clip_model=clip_model)
         rq_model_path = os.path.join(config.genir_dir, config.codebook_config.quantizer_path)
-        self.quantizer.load_state_dict(torch.load(rq_model_path, map_location=torch.device('cpu'))["model"], strict=False)
+        self.quantizer.load_state_dict(torch.load(rq_model_path, map_location=torch.device('cpu'))["model"])
         self.quantizer.eval()
         for _, param in self.quantizer.named_parameters():
             param.requires_grad = False
@@ -186,6 +185,7 @@ class T5ForGenerativeRetrieval(nn.Module):
         self.trie_index = None
         self.trie_type = getattr(getattr(config, 'model', {}), 'trie_type', 'trie_cpp')
         self._compiled_id_gen = False
+        self.code_tokens = []
 
         # Ensure unique code 
         if self.quantizer.unique_code:
@@ -218,22 +218,20 @@ class T5ForGenerativeRetrieval(nn.Module):
     def _initialize_codebook_tokens(self):
         """Initialize codebook tokens for different levels."""
         self.level_indicators = list(string.ascii_lowercase[:self.codebook_level])
-        code_tokens = []
         for l, level in enumerate(self.level_indicators):
             if self.modality_index and l == 0:
                 for i in range(3):
-                    code_tokens.append(f'<{level}{i}>')
+                    self.code_tokens.append(f'<{level}{i}>')
                 continue
             for i in range(self.codebook_vocab):
-                code_tokens.append(f'<{level}{i}>')
-        num_new_tokens = self.tokenizer.add_tokens(code_tokens)
+                self.code_tokens.append(f'<{level}{i}>')
+        num_new_tokens = self.tokenizer.add_tokens(self.code_tokens)
         self.id_generator.resize_token_embeddings(len(self.tokenizer))
 
     def _initialize_codebook_embeddings(self, t5_config):
         """Initialize codebook embeddings from residual quantization."""
         # Get the new token IDs
-        code_tokens = [f'<{l}{i}>' for l in self.level_indicators for i in range(self.codebook_vocab)]
-        new_token_ids = self.tokenizer.convert_tokens_to_ids(code_tokens)
+        new_token_ids = self.tokenizer.convert_tokens_to_ids(self.code_tokens)
 
         # Map codebook vectors to embedding dimension
         embedding_dim = t5_config.d_model

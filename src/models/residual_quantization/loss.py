@@ -2,9 +2,6 @@
 Loss functions for Residual Quantization model.
 """
 
-# Standard library
-import numpy as np
-
 # Third-party
 import torch
 import torch.nn as nn

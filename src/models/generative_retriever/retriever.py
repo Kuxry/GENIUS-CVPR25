@@ -8,10 +8,7 @@ import re
 import math
 import random 
 import string
-from copy import deepcopy
-from dataclasses import dataclass
-from functools import lru_cache
-from typing import Optional, Tuple, Union, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any
 import pickle
 
 # Third-party
@@ -20,22 +17,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import numpy as np
-from einops import rearrange, repeat, reduce, pack, unpack
-from torch.nn.utils import weight_norm
+from einops import rearrange
 from transformers import (
-    AutoTokenizer,
     AutoModelForSeq2SeqLM,
     T5ForConditionalGeneration,
-    AutoModelForCausalLM,
-    LogitsProcessor,
     PreTrainedTokenizerFast,
 )
-from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput
-from transformers.file_utils import ModelOutput
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
-from tqdm import tqdm
 
 # Local modules
 from models.uniir_clip import utils
@@ -134,7 +124,6 @@ class T5ForGenerativeRetrieval(nn.Module):
     """
     def __init__(self, config=None, tokenizer=None, clip_model=None, new_tokenizer=True, init_rq_codebook=True):
         super().__init__()
-        self.return_logits = False
         
         # Initialize CLIP model if provided
         if clip_model is not None:
@@ -147,7 +136,7 @@ class T5ForGenerativeRetrieval(nn.Module):
         self.config = config
         self.quantizer = RQ(config=config, clip_model=clip_model)
         rq_model_path = os.path.join(config.genir_dir, config.codebook_config.quantizer_path)
-        self.quantizer.load_state_dict(torch.load(rq_model_path, map_location=torch.device('cpu'))["model"])
+        self.quantizer.load_state_dict(torch.load(rq_model_path, map_location=torch.device('cpu'))["model"], strict=False)
         self.quantizer.eval()
         for _, param in self.quantizer.named_parameters():
             param.requires_grad = False
@@ -167,9 +156,6 @@ class T5ForGenerativeRetrieval(nn.Module):
             param.requires_grad = True
 
         # Initialize loss functions
-        self.contra_projector = nn.Linear(768, t5_config.d_model)
-        self.contra_loss = ContrastiveLoss(0.01)
-        self.mse_loss = nn.MSELoss(reduction='mean')
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0)
         
         # Set up codebook parameters
@@ -177,10 +163,8 @@ class T5ForGenerativeRetrieval(nn.Module):
         self.codebook_level = self.quantizer.codebook_level
         
         # Initialize model parameters
-        self.add_doc2query_task = False
         self.iter = 0
         self.alpha = getattr(getattr(config, 'hyperparameter_config', {}), 'alpha', 2)
-        self.seperator = ''
         self.tokenizer = tokenizer
         self.trie_index = None
         self.trie_type = getattr(getattr(config, 'model', {}), 'trie_type', 'trie_cpp')
@@ -294,12 +278,6 @@ class T5ForGenerativeRetrieval(nn.Module):
                 level_indicator, value = match.groups()
                 detransformed_row.append(int(value))
         return detransformed_row
-
-    def replace_punctuation(self, text, pos_index):
-        """Replace punctuation with position information."""
-        def replace_func(match):
-            return f" for label {pos_index}{match.group()}"
-        return re.sub(r'([.?])', replace_func, text)
 
     def compute_single_batch(self, batch, gpu_id=None):
         """Compute loss and metrics for a single batch."""

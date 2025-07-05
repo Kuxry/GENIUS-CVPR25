@@ -4,14 +4,13 @@ import os
 import time
 import datetime
 from collections import defaultdict, deque
-import io
 import random
 
 # Third-party imports
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch import nn, optim
+from torch import nn
 
 
 def set_seed(seed):

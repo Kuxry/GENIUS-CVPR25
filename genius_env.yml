@@ -6,9 +6,12 @@ channels:
 dependencies:
   - python=3.10
   - pip
+  - numpy=1.23.5
   - pytorch
   - torchvision
   - pip:
+      - --no-deps
+      - transformers==4.45.2
       - python-dotenv
       - pycocoevalcap
       - omegaconf
@@ -18,7 +21,6 @@ dependencies:
       - regex
       - typeguard
       - datasets
-      - transformers=4.45.2
       - git+https://github.com/openai/CLIP.git
       - timm
       - fairscale
@@ -29,4 +31,5 @@ dependencies:
       - scipy
       - tokenizers
       - vector-quantize-pytorch
-  - numpy=1.23.5
+      - scikit-learn
+      - pybind11

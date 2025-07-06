@@ -1,17 +1,15 @@
-name: genius
+name: genius2
 channels:
   - defaults
   - conda-forge
   - pytorch
 dependencies:
   - python=3.10
+  - numpy=1.24.4
   - pip
-  - numpy=1.23.5
   - pytorch
   - torchvision
   - pip:
-      - --no-deps
-      - transformers==4.45.2
       - python-dotenv
       - pycocoevalcap
       - omegaconf
@@ -21,6 +19,7 @@ dependencies:
       - regex
       - typeguard
       - datasets
+      - transformers==4.45.2
       - git+https://github.com/openai/CLIP.git
       - timm
       - fairscale

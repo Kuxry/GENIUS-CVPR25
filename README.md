@@ -6,6 +6,19 @@ This repo contains the codebase for the CVPR 2025 paper "[GENIUS: A Generative F
   <a href="https://arxiv.org/pdf/2503.19868" target="_blank" style="margin: 2px;"><img alt="arXiv" src="https://img.shields.io/badge/📄%20arXiv-2503.19868-b31b1b?color=b31b1b&logoColor=white" style="display: inline-block; vertical-align: middle;"/></a> <a href="https://sung-yeon-kim.github.io/project_pages/GENIUS/index.html" target="_blank" style="margin: 2px;"><img alt="Project Page" src="https://img.shields.io/badge/🌐%20Project%20Page-GENIUS-ff6b6b?color=ff6b6b&logoColor=white" style="display: inline-block; vertical-align: middle;"/></a> <a href="https://github.com/sung-yeon-kim/GENIUS-CVPR25" target="_blank" style="margin: 2px;"><img alt="GitHub" src="https://img.shields.io/badge/💻%20GitHub-GENIUS-2ea44f?color=2ea44f&logoColor=white" style="display: inline-block; vertical-align: middle;"/></a> <a href="https://huggingface.co/Sungyeon/GENIUS" target="_blank" style="margin: 2px;"><br><img alt="HuggingFace" src="https://img.shields.io/badge/🤗%20Checkpoint-GENIUS-ffd700?color=ffd700&logoColor=black" style="display: inline-block; vertical-align: middle;"/></a> <a href="https://github.com/sung-yeon-kim/GENIUS-CVPR25/blob/main/LICENSE" target="_blank" style="margin: 2px;"><img alt="license" src="https://img.shields.io/badge/📜%20License-MIT-4b0082?color=4b0082&logoColor=white" style="display: inline-block; vertical-align: middle;"/></a>
 </div>
 
+## Notice (July 5th Update)
+Several latent bugs introduced during earlier refactoring have been fixed, including a critical dimension mismatch issue in `retriever.py` during the decoder training phase. Specifically, mismatched token embeddings caused by misaligned special tokens have been resolved.
+
+In addition, we have:
+
+- Updated and explicitly specified library versions in the conda environment to improve reproducibility
+
+- Fixed minor path inconsistencies and typos in training scripts
+
+- Other minor bugs and inconsistencies that may have caused silent failures or instability
+
+🔁 Please make sure to git pull the latest version and re-create your conda environment accordingly.
+
 ## Introduction
 
 We propose **GENIUS**, a **universal generative retrieval framework** that supports diverse tasks across multiple modalities. By learning discrete, modality‐decoupled IDs via **semantic quantization**, GENIUS encodes multimodal data into compact identifiers and performs constant‐time retrieval with competitive accuracy. 
@@ -136,7 +149,6 @@ bash run_feature_extraction_cand.sh
 2. Compile trie_cpp (recommended for faster inference):
 ```bash
 cd models/generative_retriever
-pip install pybind11
 c++ -O3 -Wall -shared -std=c++17 -fPIC \
     $(python3 -m pybind11 --includes) \
     trie_cpp.cpp -o trie_cpp$(python3-config --extension-suffix)

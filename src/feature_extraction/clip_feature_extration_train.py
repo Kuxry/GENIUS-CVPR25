@@ -259,7 +259,7 @@ def main(config):
         dist.barrier()
         if utils.is_main_process():
             for j, id in enumerate(did_list):
-                if id not in query_id_to_index:
+                if id not in pool_id_to_index:
                     id = id.item()
                     pool_id_to_index[id] = p_index
                     pool_img.append(p_img_emb[j].detach().cpu())

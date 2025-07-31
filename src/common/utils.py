@@ -174,36 +174,7 @@ def build_model_from_config(config):
         assert os.path.exists(checkpoint_path), f"Checkpoint file {checkpoint_path} does not exist."
         print(f"loading Residual Quantization checkpoint from {checkpoint_path}")
         model.load_state_dict(torch.load(checkpoint_path, map_location=torch.device('cpu'))["model"], strict=False)
-
-    elif model_name == "BartGenerativeRetriever":
-        from models.uniir_clip.clip_nofusion.clip_nf import CLIPNoFusion
-        from transformers import BartTokenizer, BartTokenizerFast
-        from models.generative_retriever.retriever import BartForGenerativeRetrieval
-
-        model_config = config.model
-        pretrained_clip_model_dir = os.path.join(config.genir_dir, model_config.pretrained_clip_model_dir)
-        clip_model = CLIPNoFusion(
-            model_name=model_config.clip_vision_model_name,
-            download_root=pretrained_clip_model_dir,
-            config=config,
-        )
-        clip_model.float()  # The origial CLIP was in fp16 so we need to convert it to fp32
-        clip_model.eval()
-
-        pretrained_config = model_config.pretrained_config
-        pretrained_path = os.path.join(config.genir_dir, pretrained_config.pretrained_dir, pretrained_config.pretrained_name)
-        checkpoint = torch.load(pretrained_path, map_location=torch.device('cpu'))
-        clip_model.load_state_dict(checkpoint["model"])
         
-        seq2seq_tokenizer = BartTokenizerFast.from_pretrained("facebook/bart-base", model_max_length=60)
-        model = BartForGenerativeRetrieval(config=config, tokenizer=seq2seq_tokenizer, clip_model=clip_model)
-
-        ckpt_config = model_config.ckpt_config
-        checkpoint_path = os.path.join(config.genir_dir, ckpt_config.ckpt_dir, ckpt_config.ckpt_name)
-        assert os.path.exists(checkpoint_path), f"Checkpoint file {checkpoint_path} does not exist."
-        print(f"loading GenerativeRetriever checkpoint from {checkpoint_path}")
-        model.load_state_dict(torch.load(checkpoint_path, map_location=torch.device('cpu'))["model"], strict=False)
-
     elif model_name == "T5GenerativeRetriever":
         from models.uniir_clip.clip_nofusion.clip_nf import CLIPNoFusion
         from transformers import T5Tokenizer, T5TokenizerFast
@@ -227,35 +198,6 @@ def build_model_from_config(config):
         # seq2seq_tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-base", model_max_length=60)
         seq2seq_tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small", model_max_length=42)
         model = T5ForGenerativeRetrieval(config=config, tokenizer=seq2seq_tokenizer, clip_model=clip_model)
-
-        ckpt_config = model_config.ckpt_config
-        checkpoint_path = os.path.join(config.genir_dir, ckpt_config.ckpt_dir, ckpt_config.ckpt_name)
-        assert os.path.exists(checkpoint_path), f"Checkpoint file {checkpoint_path} does not exist."
-        print(f"loading GenerativeRetriever checkpoint from {checkpoint_path}")
-        model.load_state_dict(torch.load(checkpoint_path, map_location=torch.device('cpu'))["model"], strict=False)
-
-    elif model_name == "OPTGenerativeRetriever":
-        from models.uniir_clip.clip_nofusion.clip_nf import CLIPNoFusion
-        from transformers import GPT2TokenizerFast
-        from models.generative_retriever.retriever import OptForGenerativeRetrieval
-
-        model_config = config.model
-        pretrained_clip_model_dir = os.path.join(config.genir_dir, model_config.pretrained_clip_model_dir)
-        clip_model = CLIPNoFusion(
-            model_name=model_config.clip_vision_model_name,
-            download_root=pretrained_clip_model_dir,
-            config=config,
-        )
-        clip_model.float()  # The origial CLIP was in fp16 so we need to convert it to fp32
-        clip_model.eval()
-
-        pretrained_config = model_config.pretrained_config
-        pretrained_path = os.path.join(config.genir_dir, pretrained_config.pretrained_dir, pretrained_config.pretrained_name)
-        checkpoint = torch.load(pretrained_path, map_location=torch.device('cpu'))
-        clip_model.load_state_dict(checkpoint["model"])
-        
-        seq2seq_tokenizer = GPT2TokenizerFast.from_pretrained("facebook/opt-125m", model_max_length=60)
-        model = OptForGenerativeRetrieval(config=config, tokenizer=seq2seq_tokenizer, clip_model=clip_model)
 
         ckpt_config = model_config.ckpt_config
         checkpoint_path = os.path.join(config.genir_dir, ckpt_config.ckpt_dir, ckpt_config.ckpt_name)

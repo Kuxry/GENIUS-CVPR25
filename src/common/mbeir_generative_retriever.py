@@ -499,9 +499,6 @@ def generate_codes_for_config(model, img_preprocess_fn, clip_tokenizer, seq2seq_
                 if os.path.exists(cand_code_path):
                     cand_codes = np.load(cand_code_path)
                     print(f"Log: Loaded candidate pool codes from {cand_code_path}.")
-                    cand_codes = np.load(cand_code_path)
-                    print(f"Log: Loaded candidate pool codes from {cand_code_path}.")
-
                 else:
                     print(f"Warning: Candidate pool codes not found at {cand_code_path}. Using None for cand_codes.")
                     cand_codes = None

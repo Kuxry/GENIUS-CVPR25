@@ -186,6 +186,50 @@ class T5ForGenerativeRetrieval(nn.Module):
         if init_rq_codebook:
             self._initialize_codebook_embeddings(t5_config)
 
+        # # 放在 SetHead 初始化之前
+        # self.num_domains = getattr(getattr(self.config, "data_config", {}), "num_domains", 1)
+        # self.dom_emb_dim = getattr(getattr(self.config, "hyperparameter_config", {}), "dom_emb_dim", 32)
+        # self.dom_emb = nn.Embedding(self.num_domains, self.dom_emb_dim)
+
+
+        # ---- MLP SetHead (per-level) ----
+        self.level_K = []
+        if self.modality_index:
+            self.level_K.append(3)  # 首码=模态：0/1/2
+            for _ in range(self.codebook_level - 1):
+                self.level_K.append(self.codebook_vocab)
+        else:
+            for _ in range(self.codebook_level):
+                self.level_K.append(self.codebook_vocab)
+
+        hidden = getattr(getattr(self.config, "hyperparameter_config", {}), "set_head_hidden", 768)
+        in_dim = 768
+        self.set_head = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(in_dim),
+                nn.Linear(in_dim, hidden),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden, K_l)
+            ) for K_l in self.level_K
+        ])
+
+        self._build_level_token_ids()  # 复用我之前给的辅助函数
+
+    def _build_level_token_ids(self):
+        """为每一位构建该位允许的 code token 的 id 列表。"""
+        self.level_token_ids = []
+        for l, level_indicator in enumerate(self.level_indicators):
+            Ks = 3 if (self.modality_index and l == 0) else self.codebook_vocab
+            ids = []
+            for k in range(Ks):
+                tok = f"<{level_indicator}{k}>"
+                ids.append(self.tokenizer.convert_tokens_to_ids(tok))
+            self.level_token_ids.append(torch.tensor(ids, dtype=torch.long))
+
+    def set_prior_logits(self, z_q, domain_id=None):
+        return [head(z_q) for head in self.set_head]
+
     def _initialize_tokenizer(self, tokenizer):
         """Initialize a new tokenizer with special tokens."""
         special_tokens = {'pad_token': '<pad>', 'eos_token': '</s>', 'unk_token': '<unk>'}
@@ -334,29 +378,126 @@ class T5ForGenerativeRetrieval(nn.Module):
         
         # Compute loss and metrics
         logits = model_outputs.logits
-        loss = self.criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-        
-        pred_idx = logits.argmax(-1)
-        R_at_1 = (pred_idx[:bs] == labels[:bs]).all(1).sum() / bs
-        Level1_acc = (pred_idx[:bs,1:2] == labels[:bs,1:2]).all(1).sum() / bs
-        Level12_acc = (pred_idx[:bs,1:3] == labels[:bs,1:3]).all(1).sum() / bs
-        Level123_acc = (pred_idx[:bs,1:4] == labels[:bs,1:4]).all(1).sum() / bs
+        # loss = self.criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
 
-        # Prepare outputs
-        outputs = {
-            'loss': loss,
-            'R_at_1': R_at_1,
-            'Level1_acc': Level1_acc,
-            'Level12_acc': Level12_acc,
-            'Level123_acc': Level123_acc
-        }
-        
+        # === SetHead 监督（用查询向量，不要混入 pool/aug 避免泄漏）===
+        z_q = q_emb.detach()  # [B, 768] 只用查询侧编码
+        set_logits_per_level = self.set_prior_logits(z_q)  # list of [B, K_l]
+
+        # 目标来自 p_code_list（候选真值的码位）
+        set_targets = torch.tensor([row[:len(self.level_K)] for row in p_code_list],
+                                   dtype=torch.long, device=z_q.device)  # [B, L]
+        loss_set = 0.0
+        for l, lg in enumerate(set_logits_per_level):
+            loss_set = loss_set + F.cross_entropy(lg, set_targets[:, l])
+
+        # === 选择一种训练方式 ===
+        # 【方式A：只训SetHead（最简单baseline）】
+        loss = loss_set
+
+
+        # # === 其他指标（R@1，Level1/12/123_acc）===
+        # pred_idx = logits.argmax(-1)
+        # R_at_1 = (pred_idx[:bs] == labels[:bs]).all(1).sum() / bs
+        # Level1_acc = (pred_idx[:bs,1:2] == labels[:bs,1:2]).all(1).sum() / bs
+        # Level12_acc = (pred_idx[:bs,1:3] == labels[:bs,1:3]).all(1).sum() / bs
+        # Level123_acc = (pred_idx[:bs,1:4] == labels[:bs,1:4]).all(1).sum() / bs
+        #
+        # # Prepare outputs
+        # outputs = {
+        #     'loss': loss,
+        #     'R_at_1': R_at_1,
+        #     'Level1_acc': Level1_acc,
+        #     'Level12_acc': Level12_acc,
+        #     'Level123_acc': Level123_acc,
+        # }
+
         # Log examples periodically
+        # if self.iter % 200 == 0:
+        #     example = self.tokenizer.decode(pred_idx[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        #     example_labels = self.tokenizer.decode(labels[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        #     print('Retrieval Task: ' + 'Pred: ' + str(example) + ' Ans: ' + str(example_labels))
+        #
+        # self.iter += 1
+        # return outputs
+
+        # === SetHead：逐位 / 累计 准确率（自动按 level-K）===
+        K = len(self.level_K)  # 当前训练位数（自动）
+        preds = [lg.argmax(dim=-1) for lg in set_logits_per_level]  # list of [B]
+
+        set_metrics = {}
+
+        # 每一位 Top-1：set_acc_L1, set_acc_L2, ..., set_acc_LK
+        for l in range(K):
+            acc_l = (preds[l] == set_targets[:, l]).float().mean()
+            set_metrics[f"set_acc_L{l + 1}"] = acc_l.detach()
+
+        # 累计 Top-1（前缀准确率）：set_acc_prefix1..K
+        cum_mask = torch.ones(bs, dtype=torch.bool, device=device)
+        for l in range(K):
+            cum_mask &= (preds[l] == set_targets[:, l])
+            set_metrics[f"set_acc_prefix{l + 1}"] = cum_mask.float().mean().detach()
+
+        # 便利别名：exact = 前K位全部命中
+        set_metrics["set_acc_exact"] = set_metrics[f"set_acc_prefix{K}"]
+
+        # === 兼容老的引擎打印键名（如果存在就映射，没有就给0）===
+        def _get(name):
+            return set_metrics.get(name, torch.tensor(0.0, device=device))
+
+        outputs = {
+            'loss': loss,  # 这里是你的总损失（只训SetHead或联合损失都可以）
+            # 兼容旧键：让引擎日志继续能看到前1/2/3/4位累计准确率
+            'R_at_1': _get('set_acc_prefix1'),  # R@1 就是前1位准确率
+            'Level1_acc': _get('set_acc_prefix1'),
+            'Level12_acc': _get('set_acc_prefix2'),
+            'Level123_acc': _get('set_acc_prefix3'),
+            'Level1234_acc': _get('set_acc_prefix4'),
+            # 全量逐位&累计指标
+            **set_metrics,
+        }
+
+        # -------------- Log examples periodically --------------
         if self.iter % 200 == 0:
-            example = self.tokenizer.decode(pred_idx[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            example_labels = self.tokenizer.decode(labels[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            print('Retrieval Task: ' + 'Pred: ' + str(example) + ' Ans: ' + str(example_labels))
-        
+            # 展示的位数：默认只展示前8位以免过长；若K<8会自动取K
+            show_L = min(9, K)
+            # 取第一个样本做展示
+            pred_ids = [int(preds[l][0].item()) for l in range(show_L)]
+            tgt_ids = [int(set_targets[0, l].item()) for l in range(show_L)]
+            pred_tokens = " ".join([f"<{self.level_indicators[l]}{pred_ids[l]}>" for l in range(show_L)])
+            tgt_tokens = " ".join([f"<{self.level_indicators[l]}{tgt_ids[l]}>" for l in range(show_L)])
+
+            flags = []
+            cum_ok = True
+            for l in range(show_L):
+                ok = (pred_ids[l] == tgt_ids[l])
+                flags.append(f"L{l + 1}:{'✓' if ok else '✗'}")
+                cum_ok = cum_ok and ok
+            flags_str = " ".join(flags)
+
+            print(f"SetHead Example({show_L}/{K}): Pred: {pred_tokens}  Ans: {tgt_tokens}  "
+                  f"[{flags_str}]  prefix{show_L}_ok={int(cum_ok)}  exact_K={set_metrics['set_acc_exact'].item():.3f}")
+
+            # 如需打印 SeqHead，就保留这段；否则可关闭以免混淆
+            if ('logits' in locals()) and (logits is not None):
+                # 建议用“shift后”对齐查看（可选）：
+                # pred_shift = logits[:, :-1].argmax(-1)
+                # lab_shift  = labels[:, 1:].masked_fill(labels[:, 1:] == IGNORE_INDEX, self.tokenizer.pad_token_id)
+                # example = self.tokenizer.decode(pred_shift[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                # example_labels = self.tokenizer.decode(lab_shift[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                example = self.tokenizer.decode(
+                    logits.argmax(-1)[0],
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False
+                )
+                example_labels = self.tokenizer.decode(
+                    labels[0].masked_fill(labels[0] == IGNORE_INDEX, self.tokenizer.pad_token_id),
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False
+                )
+                print(f"SeqHead Example: Pred: {example}  Ans: {example_labels}")
+        # ---------------------------------------------------------
+
         self.iter += 1
         return outputs
 

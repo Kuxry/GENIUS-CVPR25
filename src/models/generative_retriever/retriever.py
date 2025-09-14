@@ -34,6 +34,53 @@ import models.generative_retriever.trie_cpp as Trie_Cpp
 from models.residual_quantization.residual_quantization import RQ
 from models.residual_quantization.loss import ClipLoss
 
+
+from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
+
+# ==== Hard-coded prior (ONLY set_head) ====
+PRIOR_SETHEAD_CKPT = "/home/iiserver31/Workbench/likaipeng/genius/checkpoint/dual_t5small/Large/Instruct/InBatch/dual_t5small_epoch_30.pth"  # 改成你的ckpt
+PRIOR_SCALE = 0.1   # 先导偏置强度，0.3~0.8 之间网格一下
+
+
+class SetHeadPriorProcessor(LogitsProcessor):
+    def __init__(self, model, z_q, level_token_ids, num_beams=1, prior_scale=0.5):
+        super().__init__()
+        self.model = model
+        self.level_token_ids = level_token_ids   # list[L]，每层合法token的id（你已经有 _build_level_token_ids）
+        self.L = len(level_token_ids)
+        self.prior_scale = prior_scale
+
+        # 预计算每层先验：list[L]，形状 [B, K_l]
+        with torch.no_grad():
+            # 用 set_head（或 set_scores）得到每层的 logits 作为先验
+            self.per_level_logits = self.model.set_prior_logits(z_q)  # list of [B, K_l]
+            # 展开到 beam 维
+            if num_beams > 1:
+                self.per_level_logits = [lg.repeat_interleave(num_beams, dim=0) for lg in self.per_level_logits]
+
+    def __call__(self, input_ids, scores):
+        """
+        input_ids: [B*num_beams, cur_len]
+        scores:    [B*num_beams, vocab_size]  —— 本步的词表logits
+        """
+        bsz = scores.size(0)
+
+        # 当前要预测的是第几位 l：decoder 输入里，第一步是 l=0
+        # 对 T5 来说，generate 会以 decoder_start_token_id 开始，故 l = 当前已生成token数
+        l = input_ids.size(1) - 1  # 若你不包含bos，可用 input_ids.size(1)
+
+        if l < 0 or l >= self.L:
+            return scores  # 超界安全返回
+
+        # 取本层先验 [B*num_beams, K_l]
+        lg = self.per_level_logits[l]
+        # 映射到词表位置：只给本层合法token加偏置
+        tok_ids = self.level_token_ids[l].to(scores.device)  # [K_l]
+        scores[:, tok_ids] = scores[:, tok_ids] + self.prior_scale * lg.to(scores.dtype)
+
+        return scores
+
+
 # ================ Constants ================
 IGNORE_INDEX = -100
 
@@ -216,6 +263,45 @@ class T5ForGenerativeRetrieval(nn.Module):
 
         self._build_level_token_ids()  # 复用我之前给的辅助函数
 
+        # 注册原型（必须在这里调用）
+        self._register_prototypes_from_codebooks()
+        # === 硬编码：只加载 set_head 先验 ===
+        self._load_set_head_prior_hardcoded()
+
+        print(f"[Prior] set-head loaded (hardcoded path ok), prior_scale={PRIOR_SCALE}")
+
+    def _load_set_head_prior_hardcoded(self):
+        path = PRIOR_SETHEAD_CKPT
+        if not path or not os.path.isfile(path):
+            print(f"[Prior|set_head] skip: file not found -> {path}")
+            return
+        sd = torch.load(path, map_location="cpu")
+        sd = sd.get("model", sd)  # 兼容 {"model":state_dict}
+        keep = {k: v for k, v in sd.items() if k.startswith("set_head.")}
+        missing, unexpected = self.load_state_dict(keep, strict=False)
+        print(f"[Prior|set_head] loaded from {path} | missing={len(missing)} unexpected={len(unexpected)}")
+        # 推理用的话可以顺手冻结
+        for p in self.set_head.parameters():
+            p.requires_grad = False
+        self.set_head.eval()
+
+        # ---- Hard-coded Prior (ONLY SetHead) ----
+    # 放在类 T5ForGenerativeRetrieval 里（与 _debug_print_codebooks 同级）
+    def _register_prototypes_from_codebooks(self):
+        """
+        从 quantizer.residual_rq.layers 里取出每一层的码本向量，归一化后
+        注册为 buffer: proto_l{idx}，形状 [K_l, 768]
+        """
+        self.level_K = []  # 这里重置并以真实码本大小为准
+        for l in range(self.codebook_level):
+            E = self.quantizer.residual_rq.layers[l]._codebook.embed  # 可能是 [1,K,D] 或 [K,D]
+            if E.dim() == 3:
+                E = E[0]
+            P = E.float()
+            P = F.normalize(P, dim=-1)  # 余弦打分/残差时更稳
+            self.register_buffer(f"proto_l{l}", P)
+            self.level_K.append(P.shape[0])
+
     def _build_level_token_ids(self):
         """为每一位构建该位允许的 code token 的 id 列表。"""
         self.level_token_ids = []
@@ -380,19 +466,32 @@ class T5ForGenerativeRetrieval(nn.Module):
         logits = model_outputs.logits
         # loss = self.criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
 
-        # === SetHead 监督（用查询向量，不要混入 pool/aug 避免泄漏）===
-        z_q = q_emb.detach()  # [B, 768] 只用查询侧编码
-        set_logits_per_level = self.set_prior_logits(z_q)  # list of [B, K_l]
+        # === SetHead 监督（残差条件化 + MLP 头, teacher-forcing）===
+        K = len(self.level_K)
+        set_targets = torch.tensor([row[:K] for row in p_code_list],
+                                   dtype=torch.long, device=q_emb.device)  # [B, K]
 
-        # 目标来自 p_code_list（候选真值的码位）
-        set_targets = torch.tensor([row[:len(self.level_K)] for row in p_code_list],
-                                   dtype=torch.long, device=z_q.device)  # [B, L]
+        # 用查询侧向量作为起点；量化器已冻结，不反传即可
+        res = q_emb.detach()  # [B,768]
+        logits_per_level = []
         loss_set = 0.0
-        for l, lg in enumerate(set_logits_per_level):
-            loss_set = loss_set + F.cross_entropy(lg, set_targets[:, l])
 
-        # === 选择一种训练方式 ===
-        # 【方式A：只训SetHead（最简单baseline）】
+        for l in range(K):
+            # 关键：从第2位开始，用“上一位真值的原型”做残差
+            if l > 0:
+                Pprev = getattr(self, f"proto_l{l - 1}")  # [K_{l-1}, 768]，在 __init__ 里已注册为 buffer
+                yprev = set_targets[:, l - 1]  # [B]
+                res = F.normalize(res - Pprev[yprev], dim=-1)
+
+            # 当前位用对应的 MLP 头打分类（你已有的 set_head[l]）
+            logits_l = self.set_head[l](res)  # [B, K_l]
+            logits_per_level.append(logits_l)
+
+            # 逐位 CE（也可加 label_smoothing）
+            loss_set = loss_set + F.cross_entropy(logits_l, set_targets[:, l])
+
+        # 建议做平均，便于不同 K 对齐尺度
+        loss_set = loss_set / K
         loss = loss_set
 
 
@@ -422,23 +521,19 @@ class T5ForGenerativeRetrieval(nn.Module):
         # return outputs
 
         # === SetHead：逐位 / 累计 准确率（自动按 level-K）===
-        K = len(self.level_K)  # 当前训练位数（自动）
-        preds = [lg.argmax(dim=-1) for lg in set_logits_per_level]  # list of [B]
+        bs = q_emb.size(0)
+        device = q_emb.device
+        preds = [lg.argmax(dim=-1) for lg in logits_per_level]  # list of [B]
 
         set_metrics = {}
-
-        # 每一位 Top-1：set_acc_L1, set_acc_L2, ..., set_acc_LK
         for l in range(K):
             acc_l = (preds[l] == set_targets[:, l]).float().mean()
             set_metrics[f"set_acc_L{l + 1}"] = acc_l.detach()
 
-        # 累计 Top-1（前缀准确率）：set_acc_prefix1..K
         cum_mask = torch.ones(bs, dtype=torch.bool, device=device)
         for l in range(K):
             cum_mask &= (preds[l] == set_targets[:, l])
             set_metrics[f"set_acc_prefix{l + 1}"] = cum_mask.float().mean().detach()
-
-        # 便利别名：exact = 前K位全部命中
         set_metrics["set_acc_exact"] = set_metrics[f"set_acc_prefix{K}"]
 
         # === 兼容老的引擎打印键名（如果存在就映射，没有就给0）===
@@ -596,7 +691,8 @@ class T5ForGenerativeRetrieval(nn.Module):
 
         print(f"Log: Loaded candidate pool Trie from {trie_save_path}.")
 
-    def constrained_beam_search(self, inputs_embeds, attention_mask=None, num_beams=10, cand_codes=None):
+    def constrained_beam_search(self, inputs_embeds, attention_mask=None, num_beams=10,
+                                cand_codes=None, z_q=None, prior_scale=PRIOR_SCALE):
         """
         Perform constrained beam search for generation.
         
@@ -622,6 +718,18 @@ class T5ForGenerativeRetrieval(nn.Module):
             else:
                 return valid_tokens
 
+        # == 先导先验：LogitsProcessor ==
+        lp = LogitsProcessorList()
+        if z_q is not None:
+            lp.append(SetHeadPriorProcessor(
+                model=self,
+                z_q=z_q,  # [B,768]，来自 inference 里 quantizer 的 encode
+                level_token_ids=self.level_token_ids,  # 你已有的每层可选token表
+                num_beams=num_beams,
+                prior_scale=prior_scale,  # 可网格搜索 0.3~1.0
+            ))
+        print("[Prior] LogitsProcessor ON")  # 只打一两次即可
+
         with torch.no_grad():
             generated = self.id_generator.generate(
                 inputs_embeds=inputs_embeds, 
@@ -632,6 +740,7 @@ class T5ForGenerativeRetrieval(nn.Module):
                 use_cache=True, 
                 max_new_tokens=self.codebook_level,
                 early_stopping=True,
+                logits_processor=lp,  # <<<<<< 接入点
             )
         return generated
 
@@ -660,15 +769,27 @@ class T5ForGenerativeRetrieval(nn.Module):
             self._compiled_id_gen = True       
 
         # Get quantized representations
+            # === 1) 编码得到查询向量 z_q（quantizer 冻结） ===
         q_output = self.quantizer.inference(img_emb, txt_emb, img_mask, txt_mask)
         emb, q_code_list = q_output['encode'], q_output['code'].tolist()
         emb = F.normalize(emb)
         instruct_str = self.tokenizer.batch_decode(inst_ids, skip_special_tokens=True)
         q_code_str_list = [self.transform_row(row) for row in q_code_list]
-
+        # === 2) 准备 decoder 的 prefix 向量 ===
         # Generate outputs
         inputs_embeds = self.embed_projector(emb).reshape(len(emb), self.num_prefix, -1)
-        outputs = self.constrained_beam_search(inputs_embeds, num_beams=num_beams, cand_codes=cand_codes)
+        # === 3) 解码：注入先验（LogitsProcessor软偏置） ===
+        # outputs = self.constrained_beam_search(inputs_embeds, num_beams=num_beams, cand_codes=cand_codes)
+        prior_scale = getattr(getattr(self.config, "hyperparameter_config", {}), "prior_scale", 0.5)
+        outputs = self.constrained_beam_search(
+            inputs_embeds,
+            num_beams=num_beams,
+            cand_codes=cand_codes,
+            z_q=emb,  # <<<< 先验来自 per-level MLP(head) 对 z_q 的打分
+            prior_scale=PRIOR_SCALE  # <<<< 先验强度，可调 0.3/0.5/0.7/1.0
+        )
+
+
         
         # Process outputs
         outputs_id = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)

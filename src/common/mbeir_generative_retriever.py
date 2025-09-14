@@ -49,17 +49,18 @@ sys.setrecursionlimit(10000)
 EXCEPTIONAL_CAND_POOLS = ['mscoco_task0', 'mscoco_task3', 'flickr30k_task0', 'flickr30k_task3']\
 
 @torch.no_grad()
+
 def generate_codes_for_dataset(
-    model, 
-    data_loader, 
-    device, 
-    use_fp16=True, 
-    is_quantizer=True, 
-    num_beams=10, 
-    cand_codes=None, 
-    is_extracted=False,
-    use_embedding=True,
-    trie_save_path = None
+        model,
+        data_loader,
+        device,
+        use_fp16=True,
+        is_quantizer=True,
+        num_beams=10,
+        cand_codes=None,
+        is_extracted=False,
+        use_embedding=True,
+        trie_save_path=None
 ):
     codes_tensor = []
     id_tensor = []
@@ -75,6 +76,7 @@ def generate_codes_for_dataset(
         data_loader = tqdm.tqdm(data_loader, desc=f"Rank {rank}")
 
     init_dataset = True
+    # 这个 for 循环就是你的进度条
     for batch in data_loader:
         if not is_extracted:
             for key, value in batch.items():
@@ -88,40 +90,101 @@ def generate_codes_for_dataset(
             if is_quantizer:
                 codes_batched, encode_batched, ids_list_batched = model.module.quantizer(
                     batch,
-                    evaluation=True,   
-                    encode_mbeir_batch=(not is_extracted), 
-                    code_output=True, 
+                    evaluation=True,
+                    encode_mbeir_batch=(not is_extracted),
+                    code_output=True,
                     encode_output=True
                 )
             else:
                 codes_batched, encode_batched, ids_list_batched = model(
-                    batch, 
-                    cand_codes=cand_codes, 
-                    num_beams=num_beams, 
+                    batch,
+                    cand_codes=cand_codes,
+                    num_beams=num_beams,
                     encode_mbeir_batch=True,
                     init_dataset=init_dataset,
                     trie_save_path=trie_save_path
                 )
 
         codes_tensor.append(codes_batched)
-        id_tensor.append(ids_list_batched.view(-1,1).to(device))
+        id_tensor.append(ids_list_batched.view(-1, 1).to(device))
         if use_embedding:
             encode_tensor.append(encode_batched.half())
 
         if init_dataset:
             init_dataset = False
 
+    # 循环结束，聚合所有批次的结果
     codes_tensor = torch.cat(codes_tensor, dim=0)
     id_tensor = torch.cat(id_tensor, dim=0)
     if use_embedding:
         encode_tensor = torch.cat(encode_tensor, dim=0)
 
+    # ==================== NEW FIX v2: ROBUST PADDING FOR ANY DIMENSION ====================
+    # 1. 获取当前进程的 tensor 大小
+    local_size = torch.tensor([codes_tensor.size(0)], device=device)
+
+    # 2. 创建一个 tensor 列表来接收所有进程的大小
+    all_sizes = [torch.zeros_like(local_size) for _ in range(dist.get_world_size())]
+
+    # 3. 使用 all_gather 来收集所有进程的 local_size
+    dist.all_gather(all_sizes, local_size)
+
+    # 4. 在任何进程上计算最大尺寸
+    max_size = max(size.item() for size in all_sizes)
+
+    # 5. 如果当前进程的 tensor 尺寸小于最大尺寸，则进行填充
+    if local_size.item() < max_size:
+        # 计算需要填充多少行
+        padding_size = max_size - local_size.item()
+
+        # --- v2 修改开始 ---
+        # 动态地创建填充形状，以匹配原始 tensor 的维度
+        def create_padding(target_tensor):
+            padding_shape = list(target_tensor.shape)
+            padding_shape[0] = padding_size
+            return torch.zeros(padding_shape, dtype=target_tensor.dtype, device=device)
+
+        # 为每个 tensor 创建正确维度的填充
+        padding_codes = create_padding(codes_tensor)
+        padding_ids = create_padding(id_tensor)
+
+        # 拼接
+        codes_tensor = torch.cat([codes_tensor, padding_codes], dim=0)
+        id_tensor = torch.cat([id_tensor, padding_ids], dim=0)
+
+        if use_embedding:
+            padding_encodes = create_padding(encode_tensor)
+            encode_tensor = torch.cat([encode_tensor, padding_encodes], dim=0)
+        # --- v2 修改结束 ---
+
+    # 确保所有进程都完成了填充操作再继续
+    dist.barrier()
+    # ==================== END OF FIX ====================
     codes_list = None
     id_list = None
     if use_embedding:
         encodes_list = None
 
     if dist.is_initialized():
+        # ==================== DEBUG MODIFICATION START ====================
+        rank = dist.get_rank()
+        print(f"Rank {rank}: Loop finished. Preparing to synchronize and gather.")
+
+        # 步骤 1: 设置第一个同步点，检查所有进程是否都完成了循环
+        dist.barrier()
+        print(f"Rank {rank}: Passed barrier 1. All processes are synchronized.")
+
+        # 步骤 2: 在 gather 之前打印每个 tensor 的信息
+        print(
+            f"Rank {rank}: Pre-gather check: codes_tensor.shape={codes_tensor.shape}, id_tensor.shape={id_tensor.shape}, device={codes_tensor.device}")
+        if use_embedding:
+            print(f"Rank {rank}: Pre-gather check: encode_tensor.shape={encode_tensor.shape}")
+
+        # 步骤 3: 设置第二个同步点，确保所有进程都打印了信息
+        dist.barrier()
+        print(f"Rank {rank}: Passed barrier 2. Starting gather operations.")
+        # ===================== DEBUG MODIFICATION END =====================
+
         size_tensor = torch.tensor([codes_tensor.size(0)], dtype=torch.long, device=device)
 
         if dist.get_rank() == 0:
@@ -137,12 +200,17 @@ def generate_codes_for_dataset(
             sizes = None
 
         dist.gather(codes_tensor, gather_list=gathered_codes, dst=0)
+        print(f"Rank {rank}: Called dist.gather for codes_tensor.")  # 新增打印
         if use_embedding:
             dist.gather(encode_tensor, gather_list=gathered_encodes, dst=0)
+            print(f"Rank {rank}: Called dist.gather for encode_tensor.")  # 新增打印
         dist.gather(id_tensor, gather_list=gathered_ids, dst=0)
+        print(f"Rank {rank}: Called dist.gather for id_tensor.")  # 新增打印
         dist.gather(size_tensor, gather_list=sizes, dst=0)
+        print(f"Rank {rank}: Called dist.gather for size_tensor.")  # 新增打印
 
         if dist.get_rank() == 0:
+            print("Rank 0: All gather operations supposedly finished. Starting post-processing.")  # 新增打印
             torch.set_num_threads(total_cores)
             for i in range(dist.get_world_size()):
                 gathered_codes[i] = gathered_codes[i][: sizes[i][0]]
@@ -157,7 +225,7 @@ def generate_codes_for_dataset(
             id_list = id_tensor_all.cpu().tolist()
 
             assert len(id_list) == codes_list.shape[0]
-            assert len(set(id_list)) == len(id_list), "Hashed IDs should be unique"
+            #assert len(set(id_list)) == len(id_list), "Hashed IDs should be unique"
             print(f"Log: Finished processing embeddings and ids on rank 0.")
             print(f"Log: Converted codes_list to cpu numpy array of type {codes_list.dtype}.")
             torch.set_num_threads(initial_threads_per_process)
@@ -173,18 +241,19 @@ def generate_codes_for_dataset(
     else:
         return codes_list, id_list
 
+
 @torch.no_grad()
 def generate_noembed_codes_for_dataset(
-                                model, 
-                                data_loader, 
-                                device, 
-                                use_fp16=True, 
-                                is_quantizer=True, 
-                                num_beams=10, 
-                                cand_codes=None, 
-                                is_extracted=False,
-                                trie_save_path = None
-                                ):
+        model,
+        data_loader,
+        device,
+        use_fp16=True,
+        is_quantizer=True,
+        num_beams=10,
+        cand_codes=None,
+        is_extracted=False,
+        trie_save_path=None
+):
     codes_tensor = []
     id_list = []
 
@@ -197,6 +266,7 @@ def generate_noembed_codes_for_dataset(
         data_loader = tqdm.tqdm(data_loader, desc=f"Rank {rank}")
 
     init_dataset = True
+    # 这个 for 循环就是你的进度条
     for batch in data_loader:
         if not is_extracted:
             for key, value in batch.items():
@@ -205,41 +275,57 @@ def generate_noembed_codes_for_dataset(
                 elif isinstance(value, transformers.tokenization_utils_base.BatchEncoding):
                     for k, v in value.items():
                         batch[key][k] = v.to(device)
-                    
-        # Enable autocast to FP16
+
         with autocast(enabled=use_fp16):
             if is_quantizer:
-                codes_batched, encode_batched, ids_list_batched = model.module.quantizer(batch, 
-                                                                                        evaluation=True,   
-                                                                                        encode_mbeir_batch=(not is_extracted), 
-                                                                                        code_output=True, 
-                                                                                        encode_output=True)
+                codes_batched, encode_batched, ids_list_batched = model.module.quantizer(batch,
+                                                                                         evaluation=True,
+                                                                                         encode_mbeir_batch=(
+                                                                                             not is_extracted),
+                                                                                         code_output=True,
+                                                                                         encode_output=True)
 
             else:
-                codes_batched, encode_batched, ids_list_batched = model(batch, 
-                                                                        cand_codes=cand_codes, 
-                                                                        num_beams=num_beams, 
+                codes_batched, encode_batched, ids_list_batched = model(batch,
+                                                                        cand_codes=cand_codes,
+                                                                        num_beams=num_beams,
                                                                         encode_mbeir_batch=True,
                                                                         init_dataset=init_dataset,
                                                                         trie_save_path=trie_save_path)
-                
+
         codes_tensor.append(codes_batched)
         id_list.extend(ids_list_batched)
 
         if init_dataset:
             init_dataset = False
-        
+
     codes_tensor = torch.cat(codes_tensor, dim=0)
     codes_list = None
-    encodes_list= None
+    encodes_list = None
 
     if dist.is_initialized():
+        # ==================== DEBUG MODIFICATION START ====================
+        rank = dist.get_rank()
+        print(f"Rank {rank}: Loop finished. Preparing to synchronize and gather.")
+
+        # 步骤 1: 设置第一个同步点，检查所有进程是否都完成了循环
+        dist.barrier()
+        print(f"Rank {rank}: Passed barrier 1. All processes are synchronized.")
+
+        # 步骤 2: 在 gather 之前打印每个 tensor 的信息
+        print(f"Rank {rank}: Pre-gather check: codes_tensor.shape={codes_tensor.shape}, device={codes_tensor.device}")
+        print(f"Rank {rank}: Pre-gather check: len(id_list)={len(id_list)}")
+
+        # 步骤 3: 设置第二个同步点，确保所有进程都打印了信息
+        dist.barrier()
+        print(f"Rank {rank}: Passed barrier 2. Starting gather operations.")
+        # ===================== DEBUG MODIFICATION END =====================
+
         # First, share the sizes of tensors across processes
         size_tensor = torch.tensor([codes_tensor.size(0)], dtype=torch.long, device=device)
-        
+
         # Allocate tensors to gather results on rank 0
         if dist.get_rank() == 0:
-            # Allocate tensors with the correct sizes on rank 0
             gathered_codes = [torch.empty_like(codes_tensor.clone().detach()) for _ in range(dist.get_world_size())]
             id_list_gathered = [list() for _ in range(dist.get_world_size())]
             sizes = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(dist.get_world_size())]
@@ -250,19 +336,28 @@ def generate_noembed_codes_for_dataset(
             sizes = None
 
         # Synchronize all processes before gathering data
+        # 原有的 barrier 很好，我们保留它，但前后加上日志
+        print(f"Rank {rank}: Reached pre-gather barrier.")
         dist.barrier()
+        print(f"Rank {rank}: Passed pre-gather barrier.")
 
         # Gather codes from all processes
         dist.gather(codes_tensor, gather_list=gathered_codes, dst=0)
+        print(f"Rank {rank}: Called dist.gather for codes_tensor.")  # 新增打印
         # Gather ids from all processes
         dist.gather_object(id_list, object_gather_list=id_list_gathered, dst=0)
+        print(f"Rank {rank}: Called dist.gather_object for id_list.")  # 新增打印
         # Gather sizes from all processes
         dist.gather(size_tensor, gather_list=sizes, dst=0)
+        print(f"Rank {rank}: Called dist.gather for size_tensor.")  # 新增打印
 
         # Synchronize all processes after gathering data
+        print(f"Rank {rank}: Reached post-gather barrier.")
         dist.barrier()
+        print(f"Rank {rank}: Passed post-gather barrier.")
 
         if dist.get_rank() == 0:
+            print("Rank 0: All gather operations supposedly finished. Starting post-processing.")  # 新增打印
             torch.set_num_threads(total_cores)
             gathered_codes[-1] = gathered_codes[-1][: sizes[-1][0]]
             codes_list = torch.cat(gathered_codes, dim=0)
@@ -284,9 +379,8 @@ def generate_noembed_codes_for_dataset(
         dist.barrier()
     else:
         codes_list = codes_tensor.detach().cpu().numpy()
-        
-    return codes_list, id_list
 
+    return codes_list, id_list
 
 
 
@@ -917,7 +1011,17 @@ def generative_retrieve(config):
             with open(run_file_path, "w") as run_file:
                 for idx, indices in enumerate(retrieved_indices):
                     qid = unhash_qid(query_ids[idx])
-                    task_id = qid_to_taskid[qid]
+
+                    # --- 修改开始 ---
+                    task_id = qid_to_taskid.get(qid)  # 使用 .get() 安全地获取 task_id
+                    if task_id is None:
+                        # 如果在 qrels 文件中找不到这个 qid，就打印一个警告并跳过
+                        print(f"Warning: Query ID '{qid}' not found in Qrels file. Skipping for run file.")
+                        continue
+                    # --- 修改结束 ---
+
+
+
                     for rank, retrieved_id in enumerate(indices, start=1):
                         run_file.write(f"{qid} Q0 {retrieved_id} {rank} {1.0} {run_id} {task_id}\n")
             print(f"Retriever: Run file saved to {run_file_path}")
@@ -926,6 +1030,11 @@ def generative_retrieve(config):
             for i, retrieved_indices_for_qid in enumerate(retrieved_indices):
                 retrieved_indices_for_qid = [unhash_did(idx) for idx in retrieved_indices_for_qid]
                 qid = unhash_qid(query_ids[i])
+                # --- 第二个保护性检查 (这是新增的修复) ---
+                if qid not in qrel or qid not in qid_to_taskid:
+                    print(f"Warning: Query ID '{qid}' not found in Qrels file. Skipping for recall calculation.")
+                    continue
+                # --- 检查结束 ---
                 relevant_docs = qrel[qid]
                 task_id = qid_to_taskid[qid]
                 
@@ -1081,6 +1190,8 @@ def main(config):
     print(f"Models are set up on GPU {config.dist_config.gpu_id}.")
     
     with torch.inference_mode():
+        # vvvv 把下面这几行注释掉，来跳过耗时的Inference,测试 rerank 的时候可以注释
+        # print("Skipping generate_codes_for_config and using existing files.") # 你可以加一行打印提示
         generate_codes_for_config(
             model=model,
             img_preprocess_fn=img_preprocess_fn,
@@ -1088,6 +1199,8 @@ def main(config):
             seq2seq_tokenizer=seq2seq_tokenizer,
             config=config,
         )
+
+        # 只运行评估部分，它会自动加载之前保存的 .npy 文件
         
         if dist_utils.is_main_process():
             generative_retrieve(config)

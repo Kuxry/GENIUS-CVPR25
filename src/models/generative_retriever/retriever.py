@@ -266,24 +266,29 @@ class T5ForGenerativeRetrieval(nn.Module):
         # 注册原型（必须在这里调用）
         self._register_prototypes_from_codebooks()
         # === 硬编码：只加载 set_head 先验 ===
-        self._load_set_head_prior_hardcoded()
+        self._load_set_head_prior_hardcoded(freeze=False)
 
         print(f"[Prior] set-head loaded (hardcoded path ok), prior_scale={PRIOR_SCALE}")
 
-    def _load_set_head_prior_hardcoded(self):
+    def _load_set_head_prior_hardcoded(self, freeze: bool = False):
         path = PRIOR_SETHEAD_CKPT
         if not path or not os.path.isfile(path):
             print(f"[Prior|set_head] skip: file not found -> {path}")
             return
         sd = torch.load(path, map_location="cpu")
-        sd = sd.get("model", sd)  # 兼容 {"model":state_dict}
+        sd = sd.get("model", sd)  # 兼容 {"model": state_dict}
         keep = {k: v for k, v in sd.items() if k.startswith("set_head.")}
+
+        # 只把 set_head 的参数喂进来；strict=False 允许部分加载
         missing, unexpected = self.load_state_dict(keep, strict=False)
         print(f"[Prior|set_head] loaded from {path} | missing={len(missing)} unexpected={len(unexpected)}")
-        # 推理用的话可以顺手冻结
+
+        # 是否冻结由 freeze 控制（训练时一定要 False）
         for p in self.set_head.parameters():
-            p.requires_grad = False
+            p.requires_grad =False
+
         self.set_head.eval()
+
 
         # ---- Hard-coded Prior (ONLY SetHead) ----
     # 放在类 T5ForGenerativeRetrieval 里（与 _debug_print_codebooks 同级）
@@ -466,6 +471,9 @@ class T5ForGenerativeRetrieval(nn.Module):
         logits = model_outputs.logits
         # loss = self.criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
 
+        # === 新增：序列头损失（T5 内置loss，已做label shift与mask）===
+        loss_seq = model_outputs.loss
+
         # === SetHead 监督（残差条件化 + MLP 头, teacher-forcing）===
         K = len(self.level_K)
         set_targets = torch.tensor([row[:K] for row in p_code_list],
@@ -494,7 +502,10 @@ class T5ForGenerativeRetrieval(nn.Module):
         loss_set = loss_set / K
         loss = loss_set
 
-
+        # === 新增：联合损失 ===
+        lambda_seq = getattr(getattr(self.config, "hyperparameter_config", {}), "lambda_seq", 1.0)
+        lambda_set = getattr(getattr(self.config, "hyperparameter_config", {}), "lambda_set", 1.0)
+        loss = lambda_seq * loss_seq + lambda_set * loss_set
         # # === 其他指标（R@1，Level1/12/123_acc）===
         # pred_idx = logits.argmax(-1)
         # R_at_1 = (pred_idx[:bs] == labels[:bs]).all(1).sum() / bs
@@ -536,12 +547,41 @@ class T5ForGenerativeRetrieval(nn.Module):
             set_metrics[f"set_acc_prefix{l + 1}"] = cum_mask.float().mean().detach()
         set_metrics["set_acc_exact"] = set_metrics[f"set_acc_prefix{K}"]
 
+        # === 5) 新增：Seq 头（与训练对齐）的“shift+mask”指标 ===
+        with torch.no_grad():
+            # pred/label 对齐: 预测对 logits[:, :-1]，标签对 labels[:, 1:]
+            pred_seq = logits[:, :-1].argmax(-1)  # [B, L-1]
+            tgt_seq = labels[:, 1:]  # [B, L-1]
+            valid = (tgt_seq != IGNORE_INDEX)  # 只在有效位统计
+            eq = (pred_seq == tgt_seq) & valid  # [B, L-1]
+
+            # exact match：所有有效位全对
+            valid_len = valid.sum(dim=1)  # [B]
+            seq_exact_acc = ((eq.sum(dim=1) == valid_len) &
+                             (valid_len > 0)).float().mean()
+
+            # 前缀累计准确率（和 set_acc_prefix* 可类比）
+            def _prefix_acc(k: int):
+                k = min(k, eq.size(1))
+                v = valid[:, :k]
+                ok = ((eq[:, :k].sum(dim=1) == v.sum(dim=1)) &
+                      (v.sum(dim=1) > 0)).float().mean()
+                return ok
+
+            seq_R_at_1 = _prefix_acc(1)
+            seq_Level1_acc = seq_R_at_1
+            seq_Level12_acc = _prefix_acc(2)
+            seq_Level123_acc = _prefix_acc(3)
+            # 如需更多层可继续：seq_Level1234_acc = _prefix_acc(4)
+
         # === 兼容老的引擎打印键名（如果存在就映射，没有就给0）===
         def _get(name):
             return set_metrics.get(name, torch.tensor(0.0, device=device))
 
         outputs = {
             'loss': loss,  # 这里是你的总损失（只训SetHead或联合损失都可以）
+            'loss_seq': loss_seq.detach(),
+            'loss_set': loss_set.detach(),
             # 兼容旧键：让引擎日志继续能看到前1/2/3/4位累计准确率
             'R_at_1': _get('set_acc_prefix1'),  # R@1 就是前1位准确率
             'Level1_acc': _get('set_acc_prefix1'),
@@ -551,6 +591,17 @@ class T5ForGenerativeRetrieval(nn.Module):
             # 全量逐位&累计指标
             **set_metrics,
         }
+        # === 只在 rank0 打印一行简要指标，确保你能看到 ===
+        is_main = (not dist.is_initialized()) or dist.get_rank() == 0
+        if is_main and (self.iter % 200 == 0):
+            print(
+                f"[it={self.iter}] "
+                f"loss={outputs['loss'].detach().cpu().item():.4f} "
+                f"seq={outputs['loss_seq']:.4f}"
+                f"set={outputs['loss_set']:.4f} "
+                f"R@1={outputs['R_at_1']:.4f} "
+                f"set_prefix2={outputs.get('set_acc_prefix2', 0.0):.4f}"
+            )
 
         # -------------- Log examples periodically --------------
         if self.iter % 200 == 0:

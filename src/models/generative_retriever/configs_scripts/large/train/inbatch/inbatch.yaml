@@ -44,13 +44,13 @@ model:
     resume_training: false
   clip_vision_model_name: ViT-L/14
   gather_embeddings: true
-  name: GENIUS_t5small
+  name: dual_t5small
   pretrained_clip_model_dir: checkpoint/CLIP/
   pretrained_config:
     pretrained_dir: checkpoint/CLIP_SF
     pretrained_name: clip_sf_large.pth
     using_pretrained: true
-  short_name: GENIUS_t5small
+  short_name: dual_t5small_combined
   size: Large
 seed: 2023
 trainer_config:
@@ -63,5 +63,5 @@ trainer_config:
 wandb_config:
   enabled: true
   experiment_name: ${experiment.description}
-  wandb_key: wandb_key
+  wandb_key: 50995eb09ac26de74b2fc2d5ee9e31fe5e7bac48
   wandb_project: GENIR

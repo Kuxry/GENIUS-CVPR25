@@ -3,9 +3,9 @@
 # set -e  # Exit immediately if a command exits with a non-zero status
 
 # Path to MBEIR data and GENIUS directory where we store the checkpoints, embeddings, etc.
-genir_dir="/GENIUS" # <--- Change this to the GENIUS directory
+genir_dir="/home/iiserver31/Workbench/likaipeng/genius" # <--- Change this to the GENIUS directory
 SRC="$genir_dir/src"  # Absolute path to codebse /GENIUS/src # <--- Change this to the path of your GENIUS/src
-MBEIR_DATA_DIR="$genir_dir/M-BEIR" # <--- Change this to the MBEIR data directory you download from HF page
+MBEIR_DATA_DIR="/data/likaipeng/M-BEIR/" # <--- Change this to the MBEIR data directory you download from HF page
 
 # Path to common dir
 COMMON_DIR="$SRC/common"

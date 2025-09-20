@@ -41,7 +41,7 @@ from transformers.generation.logits_process import LogitsProcessor, LogitsProces
 
 # ==== Hard-coded checkpoints ====
 # 1) set_head 先导头（逐层 MLP）
-PRIOR_SETHEAD_CKPT = "/home/iiserver31/Workbench/likaipeng/genius/checkpoint/dual_t5small-sethead-30/Large/Instruct/InBatch/dual_t5small_epoch_30.pth"
+PRIOR_SETHEAD_CKPT = "/home/iiserver31/Workbench/likaipeng/genius/checkpoint/dual_t5small-sethead-2layer-mlp/Large/Instruct/InBatch/dual_t5small-sethead-nomlp_epoch_30.pth"
 # 2) seq 生成头（T5 部分）
 PRIOR_SEQ_CKPT     = "/home/iiserver31/Workbench/likaipeng/genius/checkpoint/GENIUS_t5small/Large/Instruct/InBatch/GENIUS_t5small.pth"
 
@@ -265,28 +265,20 @@ class T5ForGenerativeRetrieval(nn.Module):
             for _ in range(self.codebook_level):
                 self.level_K.append(self.codebook_vocab)
 
+
+
         self.set_head = nn.ModuleList([
             nn.Sequential(
                 nn.LayerNorm(768),
-                nn.Linear(768, 768),
+                nn.Linear(768, 1536),
                 nn.GELU(),
                 nn.Dropout(0.1),
-                nn.Linear(768, K_l),
+                nn.Linear(1536, 768),  # 新增这一层
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(768, K_l)
             ) for K_l in self.level_K
         ])
-
-        # self.set_head = nn.ModuleList([
-        #     nn.Sequential(
-        #         nn.LayerNorm(768),
-        #         nn.Linear(768, 1536),
-        #         nn.GELU(),
-        #         nn.Dropout(0.1),
-        #         nn.Linear(1536, 768),  # 新增这一层
-        #         nn.GELU(),
-        #         nn.Dropout(0.1),
-        #         nn.Linear(768, K_l)
-        #     ) for K_l in self.level_K
-        # ])
         self._register_prototypes_from_codebooks()
         self._build_level_token_ids()  # 复用我之前给的辅助函数
 

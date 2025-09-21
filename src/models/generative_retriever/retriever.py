@@ -37,10 +37,8 @@ from models.residual_quantization.loss import ClipLoss
 
 from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 
-# ==== Hard-coded prior (ONLY set_head) ====
-PRIOR_SETHEAD_CKPT = "/home/iiserver31/Workbench/likaipeng/genius/checkpoint/dual_t5small/Large/Instruct/InBatch/dual_t5small_epoch_30.pth"  # 改成你的ckpt
-PRIOR_SCALE = 0.1   # 先导偏置强度，0.3~0.8 之间网格一下
 
+PRIOR_SCALE = 0.5  # 先验强度，可调
 
 class SetHeadPriorProcessor(LogitsProcessor):
     def __init__(self, model, z_q, level_token_ids, num_beams=1, prior_scale=0.5):
@@ -89,7 +87,7 @@ IGNORE_INDEX = -100
 class ContrastiveLoss(nn.Module):
     """
     Contrastive loss for feature learning.
-    
+
     Args:
         temperature: Temperature parameter for softmax
         metric: Similarity metric ('cos' or 'euclid')
@@ -102,15 +100,15 @@ class ContrastiveLoss(nn.Module):
         self.metric = metric
         self.gather = gather
         self.bidirection = bidirection
-        
+
     def get_ground_truth(self, device: torch.device, num_logits: int) -> torch.Tensor:
         """
         Generate ground truth labels.
-        
+
         Args:
             device: Device to create labels on
             num_logits: Number of logits
-            
+
         Returns:
             Tensor of labels
         """
@@ -120,12 +118,12 @@ class ContrastiveLoss(nn.Module):
     def forward(self, x: Optional[torch.Tensor] = None, y: Optional[torch.Tensor] = None, logit: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Compute contrastive loss.
-        
+
         Args:
             x: First set of embeddings
             y: Second set of embeddings
             logit: Pre-computed logits (optional)
-            
+
         Returns:
             Contrastive loss value
         """
@@ -133,7 +131,7 @@ class ContrastiveLoss(nn.Module):
             if utils.get_world_size() > 1 and self.gather:
                 x = torch.cat(utils.GatherLayer.apply(x), dim=0)
                 y = torch.cat(utils.GatherLayer.apply(y), dim=0)
-            
+
             assert x is not None and y is not None
             if self.metric == 'cos':
                 logits_per_x = F.linear(F.normalize(x), F.normalize(y))
@@ -142,7 +140,7 @@ class ContrastiveLoss(nn.Module):
             else:
                 raise ValueError(f'Invalid metric: {self.metric}')
             labels = self.get_ground_truth(x.device, x.shape[0])
-        
+
         else:
             logits_per_x = logit
             labels = self.get_ground_truth(logit.device, logit.shape[0])
@@ -155,7 +153,7 @@ class ContrastiveLoss(nn.Module):
         else:
             total_loss = F.cross_entropy(logits_per_x, labels)
         return total_loss
-        
+
 # ================ Main Model ================
 
 class T5ForGenerativeRetrieval(nn.Module):
@@ -171,14 +169,14 @@ class T5ForGenerativeRetrieval(nn.Module):
     """
     def __init__(self, config=None, tokenizer=None, clip_model=None, new_tokenizer=True, init_rq_codebook=True):
         super().__init__()
-        
+
         # Initialize CLIP model if provided
         if clip_model is not None:
             self.clip_model = clip_model
             for _, param in self.clip_model.named_parameters():
                 param.requires_grad = False
             self.clip_model.eval()
-            
+
         # Initialize model components
         self.config = config
         self.quantizer = RQ(config=config, clip_model=clip_model)
@@ -188,7 +186,7 @@ class T5ForGenerativeRetrieval(nn.Module):
         for _, param in self.quantizer.named_parameters():
             param.requires_grad = False
         self.modality_index = self.quantizer.modality_index
-        
+
         # Initialize T5 model
         t5_config = AutoModelForSeq2SeqLM.from_pretrained("google-t5/t5-small").config
         t5_config.num_layers = 0
@@ -204,11 +202,11 @@ class T5ForGenerativeRetrieval(nn.Module):
 
         # Initialize loss functions
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0)
-        
+
         # Set up codebook parameters
         self.codebook_vocab = self.quantizer.codebook_vocab
         self.codebook_level = self.quantizer.codebook_level
-        
+
         # Initialize model parameters
         self.iter = 0
         self.alpha = getattr(getattr(config, 'hyperparameter_config', {}), 'alpha', 2)
@@ -218,7 +216,7 @@ class T5ForGenerativeRetrieval(nn.Module):
         self._compiled_id_gen = False
         self.code_tokens = []
 
-        # Ensure unique code 
+        # Ensure unique code
         if self.quantizer.unique_code:
             self.codebook_level = self.codebook_level + 1
 
@@ -249,15 +247,15 @@ class T5ForGenerativeRetrieval(nn.Module):
             for _ in range(self.codebook_level):
                 self.level_K.append(self.codebook_vocab)
 
-        hidden = getattr(getattr(self.config, "hyperparameter_config", {}), "set_head_hidden", 768)
-        in_dim = 768
+
+
         self.set_head = nn.ModuleList([
             nn.Sequential(
-                nn.LayerNorm(in_dim),
-                nn.Linear(in_dim, hidden),
+                nn.LayerNorm(768),
+                nn.Linear(768, 1536),
                 nn.GELU(),
                 nn.Dropout(0.1),
-                nn.Linear(hidden, K_l)
+                nn.Linear(1536, K_l),
             ) for K_l in self.level_K
         ])
 
@@ -265,29 +263,10 @@ class T5ForGenerativeRetrieval(nn.Module):
 
         # 注册原型（必须在这里调用）
         self._register_prototypes_from_codebooks()
-        # === 硬编码：只加载 set_head 先验 ===
-        self._load_set_head_prior_hardcoded(freeze=False)
+
 
         print(f"[Prior] set-head loaded (hardcoded path ok), prior_scale={PRIOR_SCALE}")
 
-    def _load_set_head_prior_hardcoded(self, freeze: bool = False):
-        path = PRIOR_SETHEAD_CKPT
-        if not path or not os.path.isfile(path):
-            print(f"[Prior|set_head] skip: file not found -> {path}")
-            return
-        sd = torch.load(path, map_location="cpu")
-        sd = sd.get("model", sd)  # 兼容 {"model": state_dict}
-        keep = {k: v for k, v in sd.items() if k.startswith("set_head.")}
-
-        # 只把 set_head 的参数喂进来；strict=False 允许部分加载
-        missing, unexpected = self.load_state_dict(keep, strict=False)
-        print(f"[Prior|set_head] loaded from {path} | missing={len(missing)} unexpected={len(unexpected)}")
-
-        # 是否冻结由 freeze 控制（训练时一定要 False）
-        for p in self.set_head.parameters():
-            p.requires_grad =False
-
-        self.set_head.eval()
 
 
         # ---- Hard-coded Prior (ONLY SetHead) ----
@@ -433,10 +412,10 @@ class T5ForGenerativeRetrieval(nn.Module):
         q_txt_emb = query['txt_emb'].view(-1, query['txt_emb'].size(-1)).to(gpu_id, non_blocking=True)
         p_img_emb = pool['img_emb'].view(-1, pool['img_emb'].size(-1)).to(gpu_id, non_blocking=True)
         p_txt_emb = pool['txt_emb'].view(-1, pool['txt_emb'].size(-1)).to(gpu_id, non_blocking=True)
-        
+
         device = q_img_emb.device
         bs = len(q_img_emb)
-        
+
         # Process instructions
         instruct_str = self.tokenizer.batch_decode(instruct, skip_special_tokens=True)
 
@@ -449,7 +428,7 @@ class T5ForGenerativeRetrieval(nn.Module):
 
         # Prepare target codes
         p_code_str_list = [self.transform_row(row) for row in p_code_list]
-        
+
         # Apply augmentation
         s = torch.distributions.Beta(self.alpha, self.alpha).sample((bs, q_emb.size(1))).to(device)
         aug_emb = torch.sqrt(s) * q_emb + torch.sqrt(1-s) * p_emb
@@ -461,18 +440,15 @@ class T5ForGenerativeRetrieval(nn.Module):
         labels = self.tokenizer(label_id, padding=True, truncation=True).input_ids
         labels = torch.LongTensor(labels).to(device)
         labels[labels == self.tokenizer.pad_token_id] = IGNORE_INDEX
-        
+
         # Forward pass
-        model_outputs = self.id_generator(inputs_embeds=inputs_embeds, 
-                                        labels=labels, 
+        model_outputs = self.id_generator(inputs_embeds=inputs_embeds,
+                                        labels=labels,
                                         output_hidden_states=True)
-        
+
         # Compute loss and metrics
         logits = model_outputs.logits
         # loss = self.criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-
-        # === 新增：序列头损失（T5 内置loss，已做label shift与mask）===
-        loss_seq = model_outputs.loss
 
         # === SetHead 监督（残差条件化 + MLP 头, teacher-forcing）===
         K = len(self.level_K)
@@ -502,10 +478,7 @@ class T5ForGenerativeRetrieval(nn.Module):
         loss_set = loss_set / K
         loss = loss_set
 
-        # === 新增：联合损失 ===
-        lambda_seq = getattr(getattr(self.config, "hyperparameter_config", {}), "lambda_seq", 1.0)
-        lambda_set = getattr(getattr(self.config, "hyperparameter_config", {}), "lambda_set", 1.0)
-        loss = lambda_seq * loss_seq + lambda_set * loss_set
+
         # # === 其他指标（R@1，Level1/12/123_acc）===
         # pred_idx = logits.argmax(-1)
         # R_at_1 = (pred_idx[:bs] == labels[:bs]).all(1).sum() / bs
@@ -547,41 +520,12 @@ class T5ForGenerativeRetrieval(nn.Module):
             set_metrics[f"set_acc_prefix{l + 1}"] = cum_mask.float().mean().detach()
         set_metrics["set_acc_exact"] = set_metrics[f"set_acc_prefix{K}"]
 
-        # === 5) 新增：Seq 头（与训练对齐）的“shift+mask”指标 ===
-        with torch.no_grad():
-            # pred/label 对齐: 预测对 logits[:, :-1]，标签对 labels[:, 1:]
-            pred_seq = logits[:, :-1].argmax(-1)  # [B, L-1]
-            tgt_seq = labels[:, 1:]  # [B, L-1]
-            valid = (tgt_seq != IGNORE_INDEX)  # 只在有效位统计
-            eq = (pred_seq == tgt_seq) & valid  # [B, L-1]
-
-            # exact match：所有有效位全对
-            valid_len = valid.sum(dim=1)  # [B]
-            seq_exact_acc = ((eq.sum(dim=1) == valid_len) &
-                             (valid_len > 0)).float().mean()
-
-            # 前缀累计准确率（和 set_acc_prefix* 可类比）
-            def _prefix_acc(k: int):
-                k = min(k, eq.size(1))
-                v = valid[:, :k]
-                ok = ((eq[:, :k].sum(dim=1) == v.sum(dim=1)) &
-                      (v.sum(dim=1) > 0)).float().mean()
-                return ok
-
-            seq_R_at_1 = _prefix_acc(1)
-            seq_Level1_acc = seq_R_at_1
-            seq_Level12_acc = _prefix_acc(2)
-            seq_Level123_acc = _prefix_acc(3)
-            # 如需更多层可继续：seq_Level1234_acc = _prefix_acc(4)
-
         # === 兼容老的引擎打印键名（如果存在就映射，没有就给0）===
         def _get(name):
             return set_metrics.get(name, torch.tensor(0.0, device=device))
 
         outputs = {
             'loss': loss,  # 这里是你的总损失（只训SetHead或联合损失都可以）
-            'loss_seq': loss_seq.detach(),
-            'loss_set': loss_set.detach(),
             # 兼容旧键：让引擎日志继续能看到前1/2/3/4位累计准确率
             'R_at_1': _get('set_acc_prefix1'),  # R@1 就是前1位准确率
             'Level1_acc': _get('set_acc_prefix1'),
@@ -591,17 +535,6 @@ class T5ForGenerativeRetrieval(nn.Module):
             # 全量逐位&累计指标
             **set_metrics,
         }
-        # === 只在 rank0 打印一行简要指标，确保你能看到 ===
-        is_main = (not dist.is_initialized()) or dist.get_rank() == 0
-        if is_main and (self.iter % 200 == 0):
-            print(
-                f"[it={self.iter}] "
-                f"loss={outputs['loss'].detach().cpu().item():.4f} "
-                f"seq={outputs['loss_seq']:.4f}"
-                f"set={outputs['loss_set']:.4f} "
-                f"R@1={outputs['R_at_1']:.4f} "
-                f"set_prefix2={outputs.get('set_acc_prefix2', 0.0):.4f}"
-            )
 
         # -------------- Log examples periodically --------------
         if self.iter % 200 == 0:
@@ -650,11 +583,11 @@ class T5ForGenerativeRetrieval(nn.Module):
     def get_img_preprocess_fn(self):
         """Get image preprocessing function from CLIP model."""
         return self.clip_model.get_img_preprocess_fn()
-    
+
     def get_clip_tokenizer(self):
         """Get CLIP tokenizer."""
         return self.clip_model.get_tokenizer()
-    
+
     def get_seq2seq_tokenizer(self):
         """Get sequence-to-sequence tokenizer."""
         return self.tokenizer
@@ -662,10 +595,10 @@ class T5ForGenerativeRetrieval(nn.Module):
     def generative_index(self, cand_codes):
         """
         Construct Trie Index for efficient retrieval.
-        
+
         Args:
             cand_codes: Candidate codes to index
-            
+
         Returns:
             Trie index for the candidate codes
         """
@@ -674,7 +607,7 @@ class T5ForGenerativeRetrieval(nn.Module):
         trie_path = os.path.join(self.config.genir_dir, ckpt_config.ckpt_dir)
         cand_codes_str = [self.transform_row(row) for row in cand_codes]
         cand_codes_ids = np.array(self.tokenizer(cand_codes_str, add_special_tokens=False).input_ids).tolist()
-        
+
         if self.trie_type == 'marisa':
             trie = MarisaTrie(cand_codes_ids)
         elif self.trie_type == 'triecpp':
@@ -686,7 +619,7 @@ class T5ForGenerativeRetrieval(nn.Module):
     def distribute_trie(self, cand_codes, trie_save_path):
         """
         Distribute Trie index across processes.
-        
+
         Args:
             cand_codes: Candidate codes to index
             trie_save_path: Path to save the Trie index
@@ -746,13 +679,13 @@ class T5ForGenerativeRetrieval(nn.Module):
                                 cand_codes=None, z_q=None, prior_scale=PRIOR_SCALE):
         """
         Perform constrained beam search for generation.
-        
+
         Args:
             inputs_embeds: Input embeddings
             attention_mask: Attention mask
             num_beams: Number of beams for search
             cand_codes: Candidate codes
-            
+
         Returns:
             Generated sequences
         """
@@ -783,12 +716,12 @@ class T5ForGenerativeRetrieval(nn.Module):
 
         with torch.no_grad():
             generated = self.id_generator.generate(
-                inputs_embeds=inputs_embeds, 
+                inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                num_beams=num_beams, 
+                num_beams=num_beams,
                 num_return_sequences=num_beams,
                 prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
-                use_cache=True, 
+                use_cache=True,
                 max_new_tokens=self.codebook_level,
                 early_stopping=True,
                 logits_processor=lp,  # <<<<<< 接入点
@@ -799,7 +732,7 @@ class T5ForGenerativeRetrieval(nn.Module):
     def inference(self, img_emb, txt_emb, img_mask, txt_mask, inst_ids, num_beams=10, cand_codes=None):
         """
         Perform inference on input embeddings.
-        
+
         Args:
             img_emb: Image embeddings
             txt_emb: Text embeddings
@@ -808,7 +741,7 @@ class T5ForGenerativeRetrieval(nn.Module):
             inst_ids: Instruction IDs
             num_beams: Number of beams for search
             cand_codes: Candidate codes
-            
+
         Returns:
             Generated codes and normalized embeddings
         """
@@ -817,7 +750,7 @@ class T5ForGenerativeRetrieval(nn.Module):
 
         if not self._compiled_id_gen:
             self.id_generator = torch.compile(self.id_generator)
-            self._compiled_id_gen = True       
+            self._compiled_id_gen = True
 
         # Get quantized representations
             # === 1) 编码得到查询向量 z_q（quantizer 冻结） ===
